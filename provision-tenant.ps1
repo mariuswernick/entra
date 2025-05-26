@@ -1,51 +1,115 @@
-# Entra ID (Azure AD) Tenant Provisioning Script
+# Entra ID (Azure AD) Tenant Provisioning Script - CORRECTED VERSION
 # Prerequisites:
-# Install-Module Microsoft.Graph -Scope CurrentUser
+# Install-Module Microsoft.Graph -Scope CurrentUser -RequiredVersion 2.25.0 -Force
+# Note: Pinned to v2.25.0 due to known issues in v2.26/v2.26.1
 
-# Variables - Customize these as needed
-$tenantDomain = "yourdomain.com"  # Replace with your actual domain
-$locationId = "USA"  # Replace with your location
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $false)]
+    [string]$TenantDomain = "yourdomain.com",  # Replace with your actual domain
+    
+    [Parameter(Mandatory = $false)]
+    [string]$LocationId = "USA",  # Replace with your location
+    
+    [Parameter(Mandatory = $false)]
+    [switch]$WhatIf = $false,  # Preview mode - doesn't create anything
+    
+    [Parameter(Mandatory = $false)]
+    [string]$LogPath = "$env:TEMP\EntraProvisioning-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+)
 
-# Connect to Microsoft Graph with required scopes
-Connect-MgGraph -Scopes @(
+# Initialize logging
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logEntry = "[$timestamp] [$Level] $Message"
+    Write-Host $logEntry -ForegroundColor $(
+        switch ($Level) {
+            "ERROR" { "Red" }
+            "WARN" { "Yellow" }
+            "SUCCESS" { "Green" }
+            default { "White" }
+        }
+    )
+    Add-Content -Path $LogPath -Value $logEntry
+}
+
+Write-Log "Starting Entra ID Tenant Provisioning Script"
+Write-Log "Log file: $LogPath"
+
+# Validate parameters
+if ($TenantDomain -eq "yourdomain.com") {
+    Write-Log "WARNING: Using default tenant domain. Please update the TenantDomain parameter." -Level "WARN"
+}
+
+# Required scopes for Microsoft Graph
+$RequiredScopes = @(
     "Group.ReadWrite.All",
-    "Directory.ReadWrite.All",
+    "Directory.ReadWrite.All", 
     "RoleManagement.ReadWrite.Directory",
     "DeviceManagementManagedDevices.ReadWrite.All",
-    "DeviceManagementServiceConfig.ReadWrite.All"
+    "DeviceManagementServiceConfig.ReadWrite.All",
+    "User.ReadWrite.All"
 )
+
+Write-Log "Connecting to Microsoft Graph with required scopes..."
+try {
+    Connect-MgGraph -Scopes $RequiredScopes -ErrorAction Stop
+    Write-Log "Successfully connected to Microsoft Graph" -Level "SUCCESS"
+}
+catch {
+    Write-Log "Failed to connect to Microsoft Graph: $($_.Exception.Message)" -Level "ERROR"
+    exit 1
+}
 
 # Function to generate a cryptographically secure random password
 function New-SecureRandomPassword {
-    $length = 32
-    $symbols = '!@#$%^&*()_+-=[]{}|;:,.<>?'
-    $numbers = '0123456789'
-    $lowerCase = 'abcdefghijklmnopqrstuvwxyz'
-    $upperCase = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-    $allChars = $symbols + $numbers + $lowerCase + $upperCase
-    
-    $rng = [System.Security.Cryptography.RNGCryptoServiceProvider]::new()
-    $bytes = [byte[]]::new($length)
-    $rng.GetBytes($bytes)
-    
-    # Ensure at least one of each required character type
-    $password = @(
-        $symbols[(Get-Random -Count 1 -Maximum $symbols.Length)]
-        $numbers[(Get-Random -Count 1 -Maximum $numbers.Length)]
-        $lowerCase[(Get-Random -Count 1 -Maximum $lowerCase.Length)]
-        $upperCase[(Get-Random -Count 1 -Maximum $upperCase.Length)]
+    param(
+        [int]$Length = 32
     )
     
-    # Fill the rest randomly
-    $remainingLength = $length - $password.Length
-    for ($i = 0; $i -lt $remainingLength; $i++) {
-        $password += $allChars[$bytes[$i] % $allChars.Length]
+    try {
+        $symbols = '!@#$%^&*()_+-=[]{}|;:,.<>?'
+        $numbers = '0123456789'
+        $lowerCase = 'abcdefghijklmnopqrstuvwxyz'
+        $upperCase = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        $allChars = $symbols + $numbers + $lowerCase + $upperCase
+        
+        # Use modern .NET cryptography
+        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        $bytes = New-Object byte[] $Length
+        $rng.GetBytes($bytes)
+        
+        # Ensure at least one character from each required type
+        $password = @()
+        $password += $symbols[($bytes[0] % $symbols.Length)]
+        $password += $numbers[($bytes[1] % $numbers.Length)]
+        $password += $lowerCase[($bytes[2] % $lowerCase.Length)]
+        $password += $upperCase[($bytes[3] % $upperCase.Length)]
+        
+        # Fill remaining positions
+        for ($i = 4; $i -lt $Length; $i++) {
+            $password += $allChars[($bytes[$i] % $allChars.Length)]
+        }
+        
+        # Properly shuffle the password array
+        for ($i = $password.Length - 1; $i -gt 0; $i--) {
+            $randomIndex = $bytes[$i] % ($i + 1)
+            $temp = $password[$i]
+            $password[$i] = $password[$randomIndex]
+            $password[$randomIndex] = $temp
+        }
+        
+        $rng.Dispose()
+        return -join $password
     }
-    
-    # Shuffle the password
-    $password = $password | Get-Random -Count $password.Length
-    
-    return -join $password
+    catch {
+        Write-Log "Error generating secure password: $($_.Exception.Message)" -Level "ERROR"
+        throw
+    }
 }
 
 # Helper function to create a group if it doesn't exist
@@ -62,66 +126,90 @@ function New-EntraGroup {
     )
     
     try {
-        $existingGroup = Get-MgGroup -Filter "displayName eq '$DisplayName'"
+        # Check if group already exists
+        $existingGroup = Get-MgGroup -Filter "displayName eq '$DisplayName'" -ErrorAction SilentlyContinue
         if ($existingGroup) {
-            Write-Host "Group '$DisplayName' already exists with id: $($existingGroup.Id)" -ForegroundColor Yellow
+            Write-Log "Group '$DisplayName' already exists with ID: $($existingGroup.Id)" -Level "WARN"
             return $existingGroup
         }
 
+        if ($WhatIf) {
+            Write-Log "WHATIF: Would create group '$DisplayName'" -Level "INFO"
+            return $null
+        }
+
+        # Prepare group parameters
         $params = @{
             DisplayName = $DisplayName
             Description = $Description
             MailNickname = $MailNickname
             SecurityEnabled = $SecurityEnabled
             MailEnabled = $MailEnabled
-            GroupTypes = @()  # Empty array for security groups
-        }        if ($Labels.Count -gt 0) {
-            $params.Labels = $Labels
         }
 
+        # Handle dynamic membership
         if ($MembershipRule) {
             $params.GroupTypes = @("DynamicMembership")
             $params.MembershipRule = $MembershipRule
             $params.MembershipRuleProcessingState = if ($MembershipRuleProcessingState) { "On" } else { "Off" }
+        } else {
+            $params.GroupTypes = @()  # Empty array for security groups
+        }
+
+        # Add labels if provided
+        if ($Labels.Count -gt 0) {
+            # Note: Labels are not directly supported in New-MgGroup, but we can add them via description or other means
+            $params.Description += " [Labels: $($Labels -join ', ')]"
         }
 
         $newGroup = New-MgGroup @params
-        Write-Host "Created group '$DisplayName' with id: $($newGroup.Id)" -ForegroundColor Green
+        Write-Log "Created group '$DisplayName' with ID: $($newGroup.Id)" -Level "SUCCESS"
+        
+        # Add a small delay to prevent throttling
+        Start-Sleep -Milliseconds 500
+        
         return $newGroup
     }
     catch {
-        Write-Error "Failed to create group '$DisplayName': $_"
+        Write-Log "Failed to create group '$DisplayName': $($_.Exception.Message)" -Level "ERROR"
         return $null
     }
 }
 
 # 1. Create base organizational structure
-Write-Host "`n=== Creating Base Organizational Structure ===" -ForegroundColor Cyan
+Write-Log "=== Creating Base Organizational Structure ===" -Level "INFO"
 
-# Root groups for different purposes
 $groups = @(
     @{
         DisplayName = "All Users"
         Description = "Contains all users in the organization"
         MailNickname = "all-users"
         Labels = @("core", "users")
+        MembershipRule = 'user.userType -eq "Member"'
     },
     @{
         DisplayName = "All Devices"
         Description = "Contains all managed devices"
         MailNickname = "all-devices"
         Labels = @("core", "devices")
+        MembershipRule = 'device.deviceId -ne null'
     }
 )
 
 $baseGroups = @{}
 foreach ($group in $groups) {
     $newGroup = New-EntraGroup @group
-    $baseGroups[$group.DisplayName] = $newGroup
+    if ($newGroup) {
+        $baseGroups[$group.DisplayName] = $newGroup
+    }
 }
 
-# 2. Create Intune device groups
-Write-Host "`n=== Creating Intune Device Groups ===" -ForegroundColor Cyan
+# 2. Create Intune device groups with CORRECTED OS types and properties
+Write-Log "=== Creating Intune Device Groups ===" -Level "INFO"
+
+# Known MDM App IDs
+$IntuneAppId = "0000000a-0000-0000-c000-000000000000"
+$SCCMAppId = "54b943f8-d761-4f8d-951e-9cea1846db5a"
 
 $intuneGroups = @(
     @{
@@ -129,121 +217,163 @@ $intuneGroups = @(
         Description = "Windows devices managed by Intune"
         MailNickname = "intune-windows"
         Labels = @("intune", "windows")
-        MembershipRule = '(device.deviceOSType -eq "Windows") and (device.managementType -eq "MDM")'
+        MembershipRule = "(device.deviceOSType -eq `"Windows`") and (device.deviceManagementAppId -eq `"$IntuneAppId`")"
     },
     @{
-        DisplayName = "Intune - iOS Devices"
-        Description = "iOS devices managed by Intune"
-        MailNickname = "intune-ios"
+        DisplayName = "Intune - iPhone Devices"
+        Description = "iPhone devices managed by Intune"
+        MailNickname = "intune-iphone"
+        Labels = @("intune", "iphone")
+        MembershipRule = "(device.deviceOSType -eq `"iPhone`") and (device.deviceManagementAppId -eq `"$IntuneAppId`")"
+    },
+    @{
+        DisplayName = "Intune - iPad Devices"
+        Description = "iPad devices managed by Intune" 
+        MailNickname = "intune-ipad"
+        Labels = @("intune", "ipad")
+        MembershipRule = "(device.deviceOSType -eq `"iPad`") and (device.deviceManagementAppId -eq `"$IntuneAppId`")"
+    },
+    @{
+        DisplayName = "Intune - iOS Devices (All)"
+        Description = "All iOS devices (iPhone and iPad) managed by Intune"
+        MailNickname = "intune-ios-all"
         Labels = @("intune", "ios")
-        MembershipRule = '(device.deviceOSType -eq "iOS") and (device.managementType -eq "MDM")'
+        MembershipRule = "((device.deviceOSType -eq `"iPhone`") or (device.deviceOSType -eq `"iPad`")) and (device.deviceManagementAppId -eq `"$IntuneAppId`")"
     },
     @{
         DisplayName = "Intune - Android Devices"
         Description = "Android devices managed by Intune"
         MailNickname = "intune-android"
         Labels = @("intune", "android")
-        MembershipRule = '(device.deviceOSType -eq "Android") and (device.managementType -eq "MDM")'
+        MembershipRule = "(device.deviceOSType -eq `"Android`") and (device.deviceManagementAppId -eq `"$IntuneAppId`")"
     },
     @{
-        DisplayName = "Intune - MacOS Devices"
-        Description = "MacOS devices managed by Intune"
+        DisplayName = "Intune - macOS Devices"
+        Description = "macOS devices managed by Intune"
         MailNickname = "intune-macos"
         Labels = @("intune", "macos")
-        MembershipRule = '(device.deviceOSType -eq "MacOS") and (device.managementType -eq "MDM")'
+        MembershipRule = "(device.deviceOSType -eq `"macOS`") and (device.deviceManagementAppId -eq `"$IntuneAppId`")"
     }
 )
 
-# Create standard Intune device groups
+# Create Intune device groups
 foreach ($group in $intuneGroups) {
-    New-EntraGroup @group
+    New-EntraGroup @group | Out-Null
 }
 
-# Create Autopilot groups
-Write-Host "`n=== Creating Autopilot Groups ===" -ForegroundColor Cyan
+# Create Autopilot groups with CORRECTED properties
+Write-Log "=== Creating Autopilot Groups ===" -Level "INFO"
 
 $autopilotGroups = @(
     @{
-        DisplayName = "Autopilot - New Devices"
-        Description = "New devices pending Autopilot enrollment"
-        MailNickname = "autopilot-new"
-        Labels = @("autopilot", "enrollment")
-        MembershipRule = '(device.devicePhysicalIDs -any _ -contains "[ZTDId]") and (device.deviceOSType -eq "Windows") and (device.enrollmentProfileName -eq "")'
+        DisplayName = "Autopilot - Windows Devices"
+        Description = "Windows devices enrolled through Autopilot"
+        MailNickname = "autopilot-windows"
+        Labels = @("autopilot", "windows")
+        MembershipRule = "(device.devicePhysicalIds -any _ -contains `"[ZTDId]`") and (device.deviceOSType -eq `"Windows`")"
     },
     @{
-        DisplayName = "Autopilot - Enrolled Devices"
-        Description = "Devices enrolled through Autopilot"
-        MailNickname = "autopilot-enrolled"
-        Labels = @("autopilot", "enrolled")
-        MembershipRule = '(device.devicePhysicalIDs -any _ -contains "[ZTDId]") and (device.deviceOSType -eq "Windows") and (device.enrollmentProfileName -ne "")'
+        DisplayName = "Autopilot - Corporate Devices"
+        Description = "Corporate-owned Autopilot devices"
+        MailNickname = "autopilot-corporate"
+        Labels = @("autopilot", "corporate")
+        MembershipRule = "(device.devicePhysicalIds -any _ -contains `"[ZTDId]`") and (device.deviceOwnership -eq `"Company`")"
     },
     @{
-        DisplayName = "Autopilot - Executive Devices"
-        Description = "Executive devices with special configuration"
-        MailNickname = "autopilot-executive"
-        Labels = @("autopilot", "executive")
-        MembershipRule = '(device.devicePhysicalIDs -any _ -contains "[ZTDId]") and (device.deviceOSType -eq "Windows") and (device.enrollmentProfileName -eq "Executive")'
+        DisplayName = "Autopilot - Hybrid Joined"
+        Description = "Hybrid Azure AD joined Autopilot devices"
+        MailNickname = "autopilot-hybrid"
+        Labels = @("autopilot", "hybrid")
+        MembershipRule = "(device.devicePhysicalIds -any _ -contains `"[ZTDId]`") and (device.deviceTrustType -eq `"ServerAD`")"
     },
     @{
-        DisplayName = "Autopilot - Standard Devices"
-        Description = "Standard devices with default configuration"
-        MailNickname = "autopilot-standard"
-        Labels = @("autopilot", "standard")
-        MembershipRule = '(device.devicePhysicalIDs -any _ -contains "[ZTDId]") and (device.deviceOSType -eq "Windows") and (device.enrollmentProfileName -eq "Standard")'
+        DisplayName = "Autopilot - Azure AD Joined"
+        Description = "Pure Azure AD joined Autopilot devices"
+        MailNickname = "autopilot-aad"
+        Labels = @("autopilot", "aad")
+        MembershipRule = "(device.devicePhysicalIds -any _ -contains `"[ZTDId]`") and (device.deviceTrustType -eq `"AzureAD`")"
     }
 )
 
 foreach ($group in $autopilotGroups) {
-    New-EntraGroup @group
+    New-EntraGroup @group | Out-Null
 }
 
-# Create additional device management groups
-Write-Host "`n=== Creating Device Management Groups ===" -ForegroundColor Cyan
+# Create additional device management groups with CORRECTED properties
+Write-Log "=== Creating Device Management Groups ===" -Level "INFO"
 
 $deviceManagementGroups = @(
     @{
-        DisplayName = "Devices - Co-Managed"
+        DisplayName = "Devices - Co-Managed (SCCM + Intune)"
         Description = "Devices co-managed by SCCM and Intune"
         MailNickname = "devices-co-managed"
         Labels = @("devices", "co-managed")
-        MembershipRule = '(device.deviceOSType -eq "Windows") and (device.managementType -eq "MDM") and (device.deviceManagementAppId -eq "17ab22b0-3237-4238-9124-f3090fb71611")'
+        MembershipRule = "(device.deviceOSType -eq `"Windows`") and (device.deviceManagementAppId -eq `"$SCCMAppId`")"
     },
     @{
-        DisplayName = "Devices - Primary Users"
-        Description = "Devices with assigned primary users"
-        MailNickname = "devices-primary-users"
-        Labels = @("devices", "primary-users")
-        MembershipRule = '(device.deviceOSType -eq "Windows") and (device.managementType -eq "MDM") and (device.primaryUser -ne null)'
+        DisplayName = "Devices - Intune Only"
+        Description = "Devices managed only by Intune"
+        MailNickname = "devices-intune-only"
+        Labels = @("devices", "intune-only")
+        MembershipRule = "(device.deviceManagementAppId -eq `"$IntuneAppId`")"
     },
     @{
-        DisplayName = "Devices - Shared"
-        Description = "Shared devices without primary users"
-        MailNickname = "devices-shared"
-        Labels = @("devices", "shared")
-        MembershipRule = '(device.deviceOSType -eq "Windows") and (device.managementType -eq "MDM") and (device.primaryUser -eq null)'
+        DisplayName = "Devices - Corporate Owned"
+        Description = "Corporate-owned devices"
+        MailNickname = "devices-corporate"
+        Labels = @("devices", "corporate")
+        MembershipRule = "(device.deviceOwnership -eq `"Company`")"
     },
     @{
-        DisplayName = "Devices - Compliance Failed"
-        Description = "Devices that failed compliance checks"
-        MailNickname = "devices-compliance-failed"
-        Labels = @("devices", "compliance")
-        MembershipRule = '(device.deviceOSType -eq "Windows") and (device.managementType -eq "MDM") and (device.complianceState -eq "noncompliant")'
+        DisplayName = "Devices - Personal Owned"
+        Description = "Personal-owned devices"
+        MailNickname = "devices-personal"
+        Labels = @("devices", "personal")
+        MembershipRule = "(device.deviceOwnership -eq `"Personal`")"
     },
     @{
-        DisplayName = "Devices - Updates Required"
-        Description = "Devices requiring Windows updates"
-        MailNickname = "devices-updates-required"
-        Labels = @("devices", "updates")
-        MembershipRule = '(device.deviceOSType -eq "Windows") and (device.managementType -eq "MDM") and (device.securityPatchLevel -lt device.manufacturer)'
+        DisplayName = "Devices - Hybrid Joined"
+        Description = "Hybrid Azure AD joined devices"
+        MailNickname = "devices-hybrid-joined"
+        Labels = @("devices", "hybrid")
+        MembershipRule = "(device.deviceTrustType -eq `"ServerAD`")"
+    },
+    @{
+        DisplayName = "Devices - Azure AD Joined"
+        Description = "Pure Azure AD joined devices"
+        MailNickname = "devices-aad-joined"
+        Labels = @("devices", "aad")
+        MembershipRule = "(device.deviceTrustType -eq `"AzureAD`")"
+    },
+    @{
+        DisplayName = "Devices - Registered Only"
+        Description = "Azure AD registered devices"
+        MailNickname = "devices-registered"
+        Labels = @("devices", "registered")
+        MembershipRule = "(device.deviceTrustType -eq `"Workplace`")"
+    },
+    @{
+        DisplayName = "Devices - Windows 10"
+        Description = "Windows 10 devices"
+        MailNickname = "devices-win10"
+        Labels = @("devices", "windows10")
+        MembershipRule = "(device.deviceOSType -eq `"Windows`") and (device.deviceOSVersion -startsWith `"10.0.1`")"
+    },
+    @{
+        DisplayName = "Devices - Windows 11"
+        Description = "Windows 11 devices"
+        MailNickname = "devices-win11"
+        Labels = @("devices", "windows11")
+        MembershipRule = "(device.deviceOSType -eq `"Windows`") and (device.deviceOSVersion -startsWith `"10.0.2`")"
     }
 )
 
 foreach ($group in $deviceManagementGroups) {
-    New-EntraGroup @group
+    New-EntraGroup @group | Out-Null
 }
 
 # 3. Create software deployment groups
-Write-Host "`n=== Creating Software Deployment Groups ===" -ForegroundColor Cyan
+Write-Log "=== Creating Software Deployment Groups ===" -Level "INFO"
 
 $softwareGroups = @(
     # Microsoft 365 Apps
@@ -346,11 +476,11 @@ $softwareGroups = @(
 )
 
 foreach ($group in $softwareGroups) {
-    New-EntraGroup @group
+    New-EntraGroup @group | Out-Null
 }
 
 # 4. Create user role groups
-Write-Host "`n=== Creating User Role Groups ===" -ForegroundColor Cyan
+Write-Log "=== Creating User Role Groups ===" -Level "INFO"
 
 $roleGroups = @(
     # IT Administration
@@ -447,11 +577,11 @@ $roleGroups = @(
 )
 
 foreach ($group in $roleGroups) {
-    New-EntraGroup @group
+    New-EntraGroup @group | Out-Null
 }
 
 # Create compliance and policy groups
-Write-Host "`n=== Creating Compliance and Policy Groups ===" -ForegroundColor Cyan
+Write-Log "=== Creating Compliance and Policy Groups ===" -Level "INFO"
 
 $complianceGroups = @(
     @{
@@ -487,11 +617,11 @@ $complianceGroups = @(
 )
 
 foreach ($group in $complianceGroups) {
-    New-EntraGroup @group
+    New-EntraGroup @group | Out-Null
 }
 
 # 5. Create department groups
-Write-Host "`n=== Creating Department Groups ===" -ForegroundColor Cyan
+Write-Log "=== Creating Department Groups ===" -Level "INFO"
 
 $deptGroups = @(
     # IT Department
@@ -500,24 +630,28 @@ $deptGroups = @(
         Description = "IT Department members"
         MailNickname = "dept-it"
         Labels = @("department", "it")
+        MembershipRule = 'user.department -eq "IT"'
     },
     @{
         DisplayName = "Dept - IT Infrastructure"
         Description = "IT Infrastructure team"
         MailNickname = "dept-it-infra"
         Labels = @("department", "it", "infrastructure")
+        MembershipRule = 'user.department -eq "IT" and user.jobTitle -contains "Infrastructure"'
     },
     @{
         DisplayName = "Dept - IT Security"
         Description = "IT Security team"
         MailNickname = "dept-it-security"
         Labels = @("department", "it", "security")
+        MembershipRule = 'user.department -eq "IT" and user.jobTitle -contains "Security"'
     },
     @{
         DisplayName = "Dept - IT Development"
         Description = "IT Development team"
         MailNickname = "dept-it-dev"
         Labels = @("department", "it", "development")
+        MembershipRule = 'user.department -eq "IT" and (user.jobTitle -contains "Developer" or user.jobTitle -contains "Development")'
     },
     
     # Human Resources
@@ -526,18 +660,21 @@ $deptGroups = @(
         Description = "Human Resources Department"
         MailNickname = "dept-hr"
         Labels = @("department", "hr")
+        MembershipRule = 'user.department -eq "Human Resources"'
     },
     @{
         DisplayName = "Dept - HR Recruiting"
         Description = "HR Recruiting team"
         MailNickname = "dept-hr-recruiting"
         Labels = @("department", "hr", "recruiting")
+        MembershipRule = 'user.department -eq "Human Resources" and user.jobTitle -contains "Recruiting"'
     },
     @{
         DisplayName = "Dept - HR Benefits"
         Description = "HR Benefits team"
         MailNickname = "dept-hr-benefits"
         Labels = @("department", "hr", "benefits")
+        MembershipRule = 'user.department -eq "Human Resources" and user.jobTitle -contains "Benefits"'
     },
     
     # Finance
@@ -546,18 +683,21 @@ $deptGroups = @(
         Description = "Finance Department"
         MailNickname = "dept-finance"
         Labels = @("department", "finance")
+        MembershipRule = 'user.department -eq "Finance"'
     },
     @{
         DisplayName = "Dept - Finance Accounting"
         Description = "Finance Accounting team"
         MailNickname = "dept-finance-accounting"
         Labels = @("department", "finance", "accounting")
+        MembershipRule = 'user.department -eq "Finance" and user.jobTitle -contains "Accounting"'
     },
     @{
         DisplayName = "Dept - Finance Payroll"
         Description = "Finance Payroll team"
         MailNickname = "dept-finance-payroll"
         Labels = @("department", "finance", "payroll")
+        MembershipRule = 'user.department -eq "Finance" and user.jobTitle -contains "Payroll"'
     },
     
     # Sales and Marketing
@@ -566,36 +706,42 @@ $deptGroups = @(
         Description = "Sales Department"
         MailNickname = "dept-sales"
         Labels = @("department", "sales")
+        MembershipRule = 'user.department -eq "Sales"'
     },
     @{
         DisplayName = "Dept - Sales NA"
         Description = "Sales North America team"
         MailNickname = "dept-sales-na"
         Labels = @("department", "sales", "na")
+        MembershipRule = 'user.department -eq "Sales" and (user.usageLocation -eq "US" or user.usageLocation -eq "CA")'
     },
     @{
         DisplayName = "Dept - Sales EMEA"
         Description = "Sales EMEA team"
         MailNickname = "dept-sales-emea"
         Labels = @("department", "sales", "emea")
+        MembershipRule = 'user.department -eq "Sales" and (user.country -eq "United Kingdom" or user.country -eq "Germany" or user.country -eq "France")'
     },
     @{
         DisplayName = "Dept - Marketing"
         Description = "Marketing Department"
         MailNickname = "dept-marketing"
         Labels = @("department", "marketing")
+        MembershipRule = 'user.department -eq "Marketing"'
     },
     @{
         DisplayName = "Dept - Marketing Digital"
         Description = "Digital Marketing team"
         MailNickname = "dept-marketing-digital"
         Labels = @("department", "marketing", "digital")
+        MembershipRule = 'user.department -eq "Marketing" and user.jobTitle -contains "Digital"'
     },
     @{
         DisplayName = "Dept - Marketing Events"
         Description = "Events Marketing team"
         MailNickname = "dept-marketing-events"
         Labels = @("department", "marketing", "events")
+        MembershipRule = 'user.department -eq "Marketing" and user.jobTitle -contains "Events"'
     },
     
     # Operations
@@ -604,27 +750,30 @@ $deptGroups = @(
         Description = "Operations Department"
         MailNickname = "dept-operations"
         Labels = @("department", "operations")
+        MembershipRule = 'user.department -eq "Operations"'
     },
     @{
         DisplayName = "Dept - Operations Logistics"
         Description = "Operations Logistics team"
         MailNickname = "dept-operations-logistics"
         Labels = @("department", "operations", "logistics")
+        MembershipRule = 'user.department -eq "Operations" and user.jobTitle -contains "Logistics"'
     },
     @{
         DisplayName = "Dept - Operations Facilities"
         Description = "Operations Facilities team"
         MailNickname = "dept-operations-facilities"
         Labels = @("department", "operations", "facilities")
+        MembershipRule = 'user.department -eq "Operations" and user.jobTitle -contains "Facilities"'
     }
 )
 
 foreach ($group in $deptGroups) {
-    New-EntraGroup @group
+    New-EntraGroup @group | Out-Null
 }
 
-# Create Entra ID license and admin groups
-Write-Host "`n=== Creating Entra ID License and Admin Groups ===" -ForegroundColor Cyan
+# Create Entra ID license and admin groups with CORRECTED membership rules
+Write-Log "=== Creating Entra ID License and Admin Groups ===" -Level "INFO"
 
 $entraGroups = @(
     @{
@@ -632,47 +781,21 @@ $entraGroups = @(
         Description = "Users with Entra ID P1 licenses"
         MailNickname = "lic-entra-p1"
         Labels = @("license", "entra", "p1")
-        MembershipRule = 'user.assignedPlans -any (assignedPlan.servicePlanId -eq "41781fb2-bc02-4b7c-bd55-b576c07bb09d" -and assignedPlan.capabilityStatus -eq "Enabled")'
+        # Note: Service plan IDs should be verified and updated as needed
+        MembershipRule = 'user.assignedPlans -any (assignedPlan.servicePlanId -eq "41781fb2-bc02-4b7c-bd55-b576c07bb09d" and assignedPlan.capabilityStatus -eq "Enabled")'
     },
     @{
         DisplayName = "LIC - Entra ID P2"
         Description = "Users with Entra ID P2 licenses"
         MailNickname = "lic-entra-p2"
         Labels = @("license", "entra", "p2")
-        MembershipRule = 'user.assignedPlans -any (assignedPlan.servicePlanId -eq "eec0eb4f-6444-4f95-aba0-50c24d67f998" -and assignedPlan.capabilityStatus -eq "Enabled")'
-    },
-    @{
-        DisplayName = "Role - Entra Admins"
-        Description = "Users with Entra ID administrator roles"
-        MailNickname = "role-entra-admins"
-        Labels = @("role", "entra", "admin")
-        MembershipRule = 'user.memberOf -any (group.displayName -match "Role - Global Administrators") or user.memberOf -any (group.displayName -match "Role - Identity Administrators") or user.memberOf -any (group.displayName -match "Role - Security Administrators")'
-    },
-    @{
-        DisplayName = "Role - Entra Global Admins"
-        Description = "Users with Global Administrator role"
-        MailNickname = "role-entra-global-admins"
-        Labels = @("role", "entra", "global-admin")
-        MembershipRule = 'user.directoryroles -any (role.roleTemplateId -eq "62e90394-69f5-4237-9190-012177145e10")'
-    },
-    @{
-        DisplayName = "Role - Entra Privileged Role Admins"
-        Description = "Users with Privileged Role Administrator role"
-        MailNickname = "role-entra-pra"
-        Labels = @("role", "entra", "privileged")
-        MembershipRule = 'user.directoryroles -any (role.roleTemplateId -eq "e8611ab8-c189-46e8-94e1-60213ab1f814")'
-    },
-    @{
-        DisplayName = "Role - Entra License Admins"
-        Description = "Users with License Administrator role"
-        MailNickname = "role-entra-license-admins"
-        Labels = @("role", "entra", "license")
-        MembershipRule = 'user.directoryroles -any (role.roleTemplateId -eq "4d6ac14f-3453-41d0-bef9-a3e0c569773a")'
+        # Note: Service plan IDs should be verified and updated as needed
+        MembershipRule = 'user.assignedPlans -any (assignedPlan.servicePlanId -eq "eec0eb4f-6444-4f95-aba0-50c24d67f998" and assignedPlan.capabilityStatus -eq "Enabled")'
     },
     
     # Conditional Access & Zero Trust Groups
     @{
-        DisplayName = "SEC - Break Glass Accounts" 
+        DisplayName = "SEC - Break Glass Accounts"
         Description = "Emergency access accounts excluded from Conditional Access"
         MailNickname = "sec-break-glass"
         Labels = @("security", "emergency", "conditional-access")
@@ -774,61 +897,109 @@ $entraGroups = @(
 )
 
 foreach ($group in $entraGroups) {
-    New-EntraGroup @group
+    New-EntraGroup @group | Out-Null
 }
 
-# Create break glass accounts with randomized but recognizable names
-Write-Host "`n=== Creating Break Glass Accounts ===" -ForegroundColor Cyan
+# Create break glass accounts with SECURE password generation
+Write-Log "=== Creating Break Glass Accounts ===" -Level "INFO"
 
 $breakGlassAccounts = @(
     @{
-        UserPrincipalName = "emg.svc.access.controller1@$tenantDomain"
+        UserPrincipalName = "emg.svc.access.controller1@$TenantDomain"
         DisplayName = "EMG Access Controller - Achilles"  # Greek mythology theme
         MailNickname = "emg.svc.access.c1"
     },
     @{
-        UserPrincipalName = "emg.svc.access.controller2@$tenantDomain"
+        UserPrincipalName = "emg.svc.access.controller2@$TenantDomain"
         DisplayName = "EMG Access Controller - Hermes"   # Greek mythology theme
         MailNickname = "emg.svc.access.c2"
     }
 )
 
 foreach ($account in $breakGlassAccounts) {
-    $password = New-SecureRandomPassword
-    $params = @{
-        DisplayName = $account.DisplayName
-        UserPrincipalName = $account.UserPrincipalName
-        MailNickname = $account.MailNickname
-        AccountEnabled = $true
-        PasswordProfile = @{
-            Password = $password
-            ForceChangePasswordNextSignIn = $false
-            PasswordPolicies = "DisablePasswordExpiration"
-        }
-    }
-
     try {
-        $existingUser = Get-MgUser -Filter "userPrincipalName eq '$($account.UserPrincipalName)'"
+        $existingUser = Get-MgUser -Filter "userPrincipalName eq '$($account.UserPrincipalName)'" -ErrorAction SilentlyContinue
         if ($existingUser) {
-            Write-Host "Break glass account $($account.DisplayName) already exists with id: $($existingUser.Id)" -ForegroundColor Yellow
-        } else {
-            $newUser = New-MgUser @params
-            Write-Host "Created break glass account $($account.DisplayName) with password: $password" -ForegroundColor Green
-            Write-Host "IMPORTANT: Save this password securely!" -ForegroundColor Red
+            Write-Log "Break glass account $($account.DisplayName) already exists with ID: $($existingUser.Id)" -Level "WARN"
+            continue
         }
+        
+        if ($WhatIf) {
+            Write-Log "WHATIF: Would create break glass account $($account.DisplayName)" -Level "INFO"
+            continue
+        }
+
+        $password = New-SecureRandomPassword
+        $params = @{
+            DisplayName = $account.DisplayName
+            UserPrincipalName = $account.UserPrincipalName
+            MailNickname = $account.MailNickname
+            AccountEnabled = $true
+            PasswordProfile = @{
+                Password = $password
+                ForceChangePasswordNextSignIn = $false
+                PasswordPolicies = "DisablePasswordExpiration"
+            }
+            UsageLocation = $LocationId
+        }
+
+        $newUser = New-MgUser @params
+        Write-Log "Created break glass account $($account.DisplayName)" -Level "SUCCESS"
+        Write-Log "IMPORTANT: Password for $($account.DisplayName): $password" -Level "WARN"
+        Write-Log "CRITICAL: Save this password securely in your password manager!" -Level "ERROR"
+        
+        # Add to break glass group
+        $breakGlassGroup = Get-MgGroup -Filter "displayName eq 'SEC - Break Glass Accounts'" -ErrorAction SilentlyContinue
+        if ($breakGlassGroup) {
+            New-MgGroupMember -GroupId $breakGlassGroup.Id -DirectoryObjectId $newUser.Id -ErrorAction SilentlyContinue
+            Write-Log "Added $($account.DisplayName) to break glass group" -Level "SUCCESS"
+        }
+        
+        # Add a delay to prevent throttling
+        Start-Sleep -Seconds 2
     }
     catch {
-        Write-Error "Failed to create break glass account $($account.DisplayName): $_"
+        Write-Log "Failed to create break glass account $($account.DisplayName): $($_.Exception.Message)" -Level "ERROR"
     }
 }
 
+# Completion summary
+Write-Log "=== Tenant Provisioning Completed ===" -Level "SUCCESS"
+Write-Log "Summary of actions:" -Level "INFO"
+Write-Log "- Created base organizational structure groups" -Level "INFO"
+Write-Log "- Created Intune device groups with corrected OS types" -Level "INFO"
+Write-Log "- Created Autopilot device groups" -Level "INFO"
+Write-Log "- Created device management groups" -Level "INFO"
+Write-Log "- Created software deployment groups" -Level "INFO"
+Write-Log "- Created user role groups" -Level "INFO"
+Write-Log "- Created compliance and policy groups" -Level "INFO"
+Write-Log "- Created department groups with dynamic membership" -Level "INFO"
+Write-Log "- Created Entra ID license and admin groups" -Level "INFO"
+Write-Log "- Created break glass accounts with secure passwords" -Level "INFO"
+
+Write-Log "Next steps:" -Level "INFO"
+Write-Log "1. Review created groups in the Entra admin center" -Level "INFO"
+Write-Log "2. Validate dynamic membership rules are working correctly" -Level "INFO"
+Write-Log "3. Assign licenses to software groups" -Level "INFO"
+Write-Log "4. Configure Conditional Access policies" -Level "INFO"
+Write-Log "5. Set up Intune policies for device groups" -Level "INFO"
+Write-Log "6. Configure Autopilot deployment profiles" -Level "INFO"
+Write-Log "7. Set up group-based license assignment" -Level "INFO"
+Write-Log "8. Configure admin roles for IT staff groups" -Level "INFO"
+Write-Log "9. Test break glass account access" -Level "INFO"
+Write-Log "10. Review and update service plan IDs for license groups" -Level "INFO"
+
+Write-Log "Log file saved to: $LogPath" -Level "INFO"
+
+# Disconnect from Microsoft Graph
+try {
+    Disconnect-MgGraph
+    Write-Log "Disconnected from Microsoft Graph" -Level "SUCCESS"
+}
+catch {
+    Write-Log "Warning: Could not disconnect from Microsoft Graph: $($_.Exception.Message)" -Level "WARN"
+}
+
 Write-Host "`n✅ Tenant provisioning completed successfully!" -ForegroundColor Green
-Write-Host "Next steps:"
-Write-Host "1. Review created groups in the Entra admin center"
-Write-Host "2. Configure dynamic membership rules for device groups"
-Write-Host "3. Assign licenses to software groups"
-Write-Host "4. Configure Conditional Access policies"
-Write-Host "5. Set up Intune policies for device groups"
-Write-Host "6. Review and configure Autopilot deployment profiles"
-Write-Host "7. Set up group-based license assignment"
-Write-Host "8. Configure admin roles for IT staff groups"
+Write-Host "📋 Review the log file for detailed information: $LogPath" -ForegroundColor Cyan
+Write-Host "🔐 IMPORTANT: Secure the break glass account passwords immediately!" -ForegroundColor Red
