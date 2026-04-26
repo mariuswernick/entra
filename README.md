@@ -14,17 +14,6 @@ This repository contains a collection of PowerShell scripts and tools for managi
 
 ### PowerShell Scripts
 
-#### provision-tenant.ps1
-A comprehensive script for setting up a new Entra ID tenant with:
-- Organizational structure with dynamic security groups
-- Intune device management groups
-- Software deployment groups
-- Role-based access control groups
-- Department-based groups
-- Break glass accounts with secure naming conventions
-- Zero Trust security implementation
-- Conditional Access policy groups
-- License management groups
 
 #### offboarding.ps1
 Automates the user offboarding process with:
