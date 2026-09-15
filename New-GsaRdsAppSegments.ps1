@@ -220,6 +220,8 @@ function Get-ExistingSegment {
                }
                else { $null }
     } while ($uri)
+    # returns nothing when empty; callers wrap in @() so that an empty or
+    # single-item result still behaves as an array under Set-StrictMode
     return $all
 }
 
@@ -272,19 +274,19 @@ Write-Host "Tenant       : $($ctx.TenantId)`n"
 
 #region 2 - read and normalise the host list ------------------------------------
 
-$hosts = Get-Content -Path $Path |
-         ForEach-Object { $_.Trim().Trim('"').ToLowerInvariant() } |
-         Where-Object   { $_ -match '^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$' } |   # FQDN only, drops header and blanks
-         Sort-Object -Unique
+$hosts = @(Get-Content -Path $Path |
+           ForEach-Object { $_.Trim().Trim('"').ToLowerInvariant() } |
+           Where-Object   { $_ -match '^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$' } |   # FQDN only, drops header and blanks
+           Sort-Object -Unique)
 
 if ($ExtraHost) {
     $hosts += ($ExtraHost | ForEach-Object { $_.Trim().ToLowerInvariant() })
-    $hosts  = $hosts | Sort-Object -Unique
+    $hosts  = @($hosts | Sort-Object -Unique)
 }
 
 if (-not $hosts) { throw "No valid FQDNs found in '$Path'." }
 
-$skipped = (Get-Content -Path $Path | Where-Object { $_.Trim() }).Count - ($hosts.Count - $ExtraHost.Count)
+$skipped = @(Get-Content -Path $Path | Where-Object { $_.Trim() }).Count - ($hosts.Count - $ExtraHost.Count)
 if ($skipped -gt 0) {
     Write-Warning "$skipped line(s) in the source file were ignored (header, duplicates or not an FQDN)."
 }
@@ -305,9 +307,9 @@ if ($ConnectionBroker) {
     try {
         Import-Module RemoteDesktop -ErrorAction Stop
 
-        $live = (Get-RDServer -ConnectionBroker $ConnectionBroker |
-                 Where-Object { $_.Roles -contains 'RDS-RD-SERVER' }).Server |
-                ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique
+        $live = @((Get-RDServer -ConnectionBroker $ConnectionBroker |
+                   Where-Object { $_.Roles -contains 'RDS-RD-SERVER' }).Server |
+                  ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique)
 
         $diff = Compare-Object -ReferenceObject $live -DifferenceObject $hosts
 
@@ -343,7 +345,7 @@ if ($ConnectionBroker) {
 #region 4 - snapshot current state ----------------------------------------------
 
 Write-Host 'Reading existing application segments ...' -ForegroundColor Gray
-$before = Get-ExistingSegment
+$before = @(Get-ExistingSegment)
 Write-Host "  $($before.Count) segment(s) currently configured."
 
 $backupFile = Join-Path $BackupPath "GsaSegments-BEFORE-$Stamp.json"
@@ -423,7 +425,7 @@ if ($failed) {
 }
 
 if (-not $WhatIfPreference) {
-    $after = Get-ExistingSegment
+    $after = @(Get-ExistingSegment)
     Write-Host "`nSegments now configured: $($after.Count)`n"
 
     $afterFile = Join-Path $BackupPath "GsaSegments-AFTER-$Stamp.json"
