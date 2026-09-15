@@ -23,6 +23,15 @@ Automates the user offboarding process with:
 - Account security measures
 - Audit logging
 
+#### New-GsaRdsAppSegments.ps1
+Bulk-creates Entra Private Access (Global Secure Access) application segments for RD Session Hosts:
+- One segment per host and protocol (TCP/UDP), port 3389 by default
+- Idempotent - existing segments are detected and skipped, so it can be re-run safely
+- Optional cross-check of the host list against a live RDS deployment (Connection Broker)
+- Before/after JSON snapshots plus a CSV of any failures
+- Supports -WhatIf for a dry run
+- Requires Application.ReadWrite.All and NetworkAccess.ReadWrite.All
+
 #### entra-powershell-snippets.md
 A collection of useful PowerShell snippets for:
 - Common Entra ID management tasks
