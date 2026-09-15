@@ -53,6 +53,12 @@
     and reports differences before making any change. Requires the RemoteDesktop module
     and is normally run from a management server, not from the machine running Graph.
 
+.PARAMETER UseDeviceCode
+    Signs in with device code flow instead of the interactive browser. Use this from
+    an embedded terminal (VS Code, ISE, a remote console), where the Windows Account
+    Manager broker cannot obtain a parent window handle and sign-in fails with
+    "A window handle must be configured".
+
 .PARAMETER BackupPath
     Folder for the before/after segment exports. Defaults to the current directory.
 
@@ -116,6 +122,15 @@
     already exist. The script is idempotent, so this is the normal way to
     re-run it after new session hosts have been added to the file.
 
+.EXAMPLE
+    .\New-GsaRdsAppSegments.ps1 `
+        -AppObjectId '00000000-0000-0000-0000-000000000000' `
+        -Path        '.\RDP-hosts.csv' `
+        -UseDeviceCode
+
+    Sign-in via device code. Use from VS Code, ISE or any embedded terminal, where
+    the interactive browser broker cannot be parented to a window.
+
 .NOTES
     Required Entra role : Application Administrator or Global Secure Access Administrator
     Required scopes     : Application.ReadWrite.All, NetworkAccess.ReadWrite.All
@@ -141,6 +156,8 @@ param(
     [string[]] $Protocol    = @('tcp', 'udp'),
 
     [string]   $ConnectionBroker,
+
+    [switch]   $UseDeviceCode,
 
     [string]   $BackupPath  = (Get-Location).Path
 )
@@ -195,7 +212,13 @@ function Get-ExistingSegment {
     do {
         $page = Invoke-GraphWithRetry -Method GET -Uri $uri
         if ($page.value) { $all += $page.value }
-        $uri = if ($page.PSObject.Properties.Name -contains '@odata.nextLink') { $page.'@odata.nextLink' } else { $null }
+        $uri = if ($page -is [System.Collections.IDictionary] -and $page.Contains('@odata.nextLink')) {
+                   $page['@odata.nextLink']
+               }
+               elseif ($page.PSObject.Properties.Name -contains '@odata.nextLink') {
+                   $page.'@odata.nextLink'
+               }
+               else { $null }
     } while ($uri)
     return $all
 }
@@ -215,7 +238,24 @@ try { $ctx = Get-MgContext } catch { }
 
 if (-not $ctx) {
     Write-Host 'Connecting to Microsoft Graph ...' -ForegroundColor Gray
-    Connect-MgGraph -Scopes 'Application.ReadWrite.All', 'NetworkAccess.ReadWrite.All' | Out-Null
+
+    $connectArgs = @{ Scopes = @('Application.ReadWrite.All', 'NetworkAccess.ReadWrite.All') }
+    if ($UseDeviceCode) { $connectArgs['UseDeviceAuthentication'] = $true }
+
+    try {
+        Connect-MgGraph @connectArgs | Out-Null
+    }
+    catch {
+        # The WAM broker needs a parent window handle, which embedded terminals
+        # (VS Code, ISE, remote consoles) cannot supply.
+        if ($_.Exception.Message -match 'window handle') {
+            throw "Interactive sign-in failed because the Windows Account Manager broker " +
+                  "has no window to attach to. Either re-run with -UseDeviceCode, or " +
+                  "disable the broker once with: Set-MgGraphOption -DisableLoginByWAM `$true"
+        }
+        throw
+    }
+
     $ctx = Get-MgContext
 }
 
