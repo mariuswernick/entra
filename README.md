@@ -25,7 +25,7 @@ Automates the user offboarding process with:
 
 #### New-GsaRdsAppSegments.ps1
 Bulk-creates Entra Private Access (Global Secure Access) application segments for RD Session Hosts:
-- One segment per host and protocol (TCP/UDP), port 3389 by default
+- One segment per host, publishing TCP and UDP together as "tcp,udp", port 3389 by default
 - Idempotent - existing segments are detected and skipped, so it can be re-run safely
 - Optional cross-check of the host list against a live RDS deployment (Connection Broker)
 - Before/after JSON snapshots plus a CSV of any failures

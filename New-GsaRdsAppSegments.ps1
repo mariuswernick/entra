@@ -4,8 +4,10 @@
     for a list of RD Session Hosts read from a text/CSV file.
 
 .DESCRIPTION
-    Creates one ipApplicationSegment per host and protocol (TCP + UDP) on port 3389
-    against an existing Global Secure Access enterprise application.
+    Creates one ipApplicationSegment per host on port 3389 against an existing
+    Global Secure Access enterprise application. TCP and UDP are published in a
+    single segment using the combined protocol value "tcp,udp", so a 57-host file
+    produces 57 segments rather than one per protocol.
 
     The script is idempotent: existing segments are detected and skipped, so it can
     be re-run safely after adding hosts to the source file.
@@ -13,7 +15,8 @@
     API reference:
       POST /beta/applications/{appObjectId}/onPremisesPublishing/segmentsConfiguration/
            microsoft.graph.ipSegmentConfiguration/applicationSegments
-      Body: destinationHost, destinationType (fqdn), ports (["3389-3389"]), protocol (tcp|udp)
+      Body: destinationHost, destinationType (fqdn), ports (["3389-3389"]),
+            protocol ("tcp", "udp" or "tcp,udp")
 
 .PARAMETER AppObjectId
     Object ID of the APP REGISTRATION behind the Global Secure Access application.
@@ -45,7 +48,8 @@
     TCP/UDP port to publish. Defaults to 3389.
 
 .PARAMETER Protocol
-    Protocols to create segments for. Defaults to both tcp and udp.
+    Protocols to publish. Defaults to both, which are combined into a single
+    segment per host as "tcp,udp". Pass a single value to publish just that one.
 
 .PARAMETER ConnectionBroker
     Optional. FQDN of an RD Connection Broker. When supplied, the script compares the
@@ -77,8 +81,8 @@
         -Path        '.\RDP-hosts.csv' `
         -ExtraHost   'rdcb.contoso.com'
 
-    Standard run. Creates TCP and UDP segments on port 3389 for every host in the
-    file, plus the RD Connection Broker client access name.
+    Standard run. Creates one segment per host on port 3389 carrying both TCP and
+    UDP, plus the RD Connection Broker client access name.
 
 .EXAMPLE
     .\New-GsaRdsAppSegments.ps1 `
@@ -171,6 +175,10 @@ $SegmentUri = "https://graph.microsoft.com/beta/applications/$AppObjectId" +
 
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
+# Graph takes the protocols as one comma-separated value, so a host needs a
+# single segment rather than one per protocol. Sorted for stable comparison.
+$ProtocolValue = (($Protocol | ForEach-Object { $_.ToLowerInvariant() }) | Sort-Object) -join ','
+
 #region helpers -----------------------------------------------------------------
 
 function Invoke-GraphWithRetry {
@@ -204,6 +212,14 @@ function Invoke-GraphWithRetry {
             throw
         }
     }
+}
+
+function ConvertTo-ProtocolKey {
+    # "udp,tcp" and "tcp,udp" describe the same segment; compare them equal.
+    param([string] $Value)
+    if (-not $Value) { return '' }
+    return ((($Value -split ',') | ForEach-Object { $_.Trim().ToLowerInvariant() } |
+             Where-Object { $_ } | Sort-Object) -join ',')
 }
 
 function Get-ExistingSegment {
@@ -292,9 +308,9 @@ if ($skipped -gt 0) {
 }
 
 Write-Host "Hosts in scope : $($hosts.Count)"
-Write-Host "Protocols      : $($Protocol -join ', ')"
+Write-Host "Protocols      : $ProtocolValue  (one segment per host)"
 Write-Host "Port           : $Port"
-Write-Host "Target segments: $($hosts.Count * $Protocol.Count)`n"
+Write-Host "Target segments: $($hosts.Count)`n"
 
 $hosts | ForEach-Object { Write-Verbose "  $_" }
 
@@ -355,7 +371,9 @@ Write-Host "  Snapshot written to $backupFile`n"
 # index of what already exists: host|protocol|ports
 $existingKey = @{}
 foreach ($s in $before) {
-    $key = '{0}|{1}|{2}' -f $s.destinationHost.ToLowerInvariant(), $s.protocol, ($s.ports -join ',')
+    $key = '{0}|{1}|{2}' -f $s.destinationHost.ToLowerInvariant(),
+                            (ConvertTo-ProtocolKey $s.protocol),
+                            ($s.ports -join ',')
     $existingKey[$key] = $s.id
 }
 
@@ -365,43 +383,62 @@ foreach ($s in $before) {
 
 $portRange = '{0}-{0}' -f $Port
 $created = 0; $skippedExisting = 0; $failed = @()
-$total   = $hosts.Count * $Protocol.Count
+$total   = $hosts.Count
 $i       = 0
 
+# An earlier run may have published one segment per protocol. Those do not match
+# the combined value, so creating on top of them would leave overlapping segments.
+$splitSegment = @($before | Where-Object {
+    $_.destinationHost.ToLowerInvariant() -in $hosts -and
+    ($_.ports -join ',') -eq $portRange -and
+    (ConvertTo-ProtocolKey $_.protocol) -ne $ProtocolValue
+})
+
+if ($splitSegment) {
+    Write-Warning "$($splitSegment.Count) existing segment(s) cover these hosts on port $Port with a different protocol value."
+    Write-Warning "Creating the combined segments as well would leave overlapping entries. Remove the old ones first:"
+    $splitSegment |
+        Select-Object destinationHost, protocol, @{ n = 'ports'; e = { $_.ports -join ',' } }, id |
+        Sort-Object destinationHost, protocol |
+        Format-Table -AutoSize
+    if (-not $PSCmdlet.ShouldContinue('Create the combined segments anyway?', 'Overlapping segments found')) {
+        Write-Host 'Aborted by user. Remove the per-protocol segments, then re-run.' -ForegroundColor Yellow
+        return
+    }
+}
+
 foreach ($h in $hosts) {
-    foreach ($p in $Protocol) {
-        $i++
-        $key = '{0}|{1}|{2}' -f $h, $p, $portRange
+    $i++
+    $key = '{0}|{1}|{2}' -f $h, $ProtocolValue, $portRange
 
-        if ($existingKey.ContainsKey($key)) {
-            $skippedExisting++
-            Write-Verbose "SKIP  $h/$p (already present)"
-            continue
-        }
+    if ($existingKey.ContainsKey($key)) {
+        $skippedExisting++
+        Write-Verbose "SKIP  $h ($ProtocolValue) - already present"
+        continue
+    }
 
-        Write-Progress -Activity 'Creating application segments' `
-                       -Status  "$h ($p)" `
-                       -PercentComplete ([int](100 * $i / $total))
+    Write-Progress -Activity 'Creating application segments' `
+                   -Status  $h `
+                   -PercentComplete ([int](100 * $i / $total))
 
-        if (-not $PSCmdlet.ShouldProcess("$h : $Port/$p", 'Create application segment')) { continue }
+    if (-not $PSCmdlet.ShouldProcess("$h : $Port/$ProtocolValue", 'Create application segment')) { continue }
 
-        $body = @{
-            destinationHost = $h
-            destinationType = 'fqdn'
-            ports           = @($portRange)
-            protocol        = $p
-        } | ConvertTo-Json -Compress
+    $body = @{
+        destinationHost = $h
+        destinationType = 'fqdn'
+        ports           = @($portRange)
+        protocol        = $ProtocolValue
+    } | ConvertTo-Json -Compress
 
-        try {
-            Invoke-GraphWithRetry -Method POST -Uri $SegmentUri -Body $body | Out-Null
-            $created++
-            Write-Host ("  OK    {0,-32} {1}" -f $h, $p) -ForegroundColor Green
-        }
-        catch {
-            $msg = $_.Exception.Message
-            $failed += [pscustomobject]@{ Host = $h; Protocol = $p; Error = $msg }
-            Write-Host ("  FAIL  {0,-32} {1}  {2}" -f $h, $p, $msg) -ForegroundColor Red
-        }
+    try {
+        Invoke-GraphWithRetry -Method POST -Uri $SegmentUri -Body $body | Out-Null
+        $created++
+        Write-Host ("  OK    {0,-32} {1}" -f $h, $ProtocolValue) -ForegroundColor Green
+    }
+    catch {
+        $msg = $_.Exception.Message
+        $failed += [pscustomobject]@{ Host = $h; Protocol = $ProtocolValue; Error = $msg }
+        Write-Host ("  FAIL  {0,-32} {1}  {2}" -f $h, $ProtocolValue, $msg) -ForegroundColor Red
     }
 }
 
